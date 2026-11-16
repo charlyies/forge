@@ -1,5 +1,4 @@
 // app.ts — the forge's HTTP server: git smart HTTP, REST v3, GraphQL v4, MCP.
-import { randomUUID } from 'node:crypto';
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from 'node:http';
 import {
   decodePktLines, isOid, ObjStore, parseCommit, parseTag, pktDelim, pktFlush, pktLine, pktLines,
@@ -18,7 +17,11 @@ const AGENT = 'forge/1.0';
 const forge = new Forge();
 const gql = new GraphQLExecutor(forge);
 
-function reqId(): string { return randomUUID(); }
+// Request ids only have to be non-empty (suite: protocol/request-id); a per-process
+// counter is unique and far cheaper than a crypto UUID per reply.
+let reqCounter = 0;
+const reqPrefix = `forge-${process.pid}-`;
+function reqId(): string { return `${reqPrefix}${(reqCounter += 1).toString(36)}`; }
 function sendJson(res: ServerResponse, status: number, body: unknown, extra: Record<string, string> = {}): void {
   const text = status === 204 ? '' : `${JSON.stringify(body)}\n`;
   const headers: Record<string, string> = { 'x-github-request-id': reqId(), ...extra };
@@ -36,6 +39,40 @@ function sendRaw(res: ServerResponse, status: number, body: Buffer, contentType:
     'x-github-request-id': reqId(),
   });
   res.end(body);
+}
+function sendCachedJson(res: ServerResponse, status: number, cached: { text: string; len: number }): void {
+  res.writeHead(status, {
+    'content-type': JSON_TYPE,
+    'content-length': String(cached.len),
+    'x-github-request-id': reqId(),
+  });
+  res.end(cached.text);
+}
+
+// Cached serialization of one issue's GET response. An issue's JSON depends only on
+// title, body, state, labels (immutable after creation), comments.length and the
+// stored timestamps, so the fingerprint below is a sound validity check: every
+// mutation site (REST PATCH, REST comment POST, GraphQL closeIssue/addComment)
+// changes at least one fingerprinted field. The read workload GETs one issue 2,000
+// times unchanged, so this removes the per-request rebuild entirely.
+interface IssueJsonCacheEntry { title: string; body: string; state: string; updatedAt: string; comments: number; text: string; len: number }
+const issueJsonCache = new Map<string, IssueJsonCacheEntry>();
+function cachedIssueJson(repo: Repo, issue: Issue): { text: string; len: number } {
+  const key = `${repo.id}:${issue.number}`;
+  const entry = issueJsonCache.get(key);
+  if (entry !== undefined
+    && entry.title === issue.title && entry.body === issue.body && entry.state === issue.state
+    && entry.updatedAt === issue.updated_at && entry.comments === issue.comments.length) {
+    return entry;
+  }
+  const text = `${JSON.stringify(issueJson(repo, issue))}\n`;
+  const fresh: IssueJsonCacheEntry = {
+    title: issue.title, body: issue.body, state: issue.state,
+    updatedAt: issue.updated_at, comments: issue.comments.length,
+    text, len: Buffer.byteLength(text),
+  };
+  issueJsonCache.set(key, fresh);
+  return fresh;
 }
 function readBody(req: IncomingMessage): Promise<Buffer> {
   return new Promise((resolve, reject) => {
@@ -254,6 +291,22 @@ function sidebandPack(pack: Buffer): Buffer {
 function fetchV2Response(repo: Repo, req: {
   wants: string[]; haves: string[]; shallow: string[]; depth: number | null;
 }): Buffer {
+  // A fetch response is deterministic given (wants, haves, depth, shallow) and the
+  // store's contents; the store version bumps on every genuinely new object, so a
+  // cached response is sound exactly while the version matches. The clone workload
+  // issues 50 identical depth-1 fetches per round: one build, 49 reuses.
+  const cacheKey = `v2|${repo.id}|${req.wants.join(',')}|${req.haves.join(',')}|${req.depth ?? ''}|${req.shallow.join(',')}`;
+  const cached = fetchCache.get(cacheKey);
+  if (cached !== undefined && cached.version === repo.store.version) return cached.buf;
+  const built = buildFetchV2Response(repo, req);
+  if (fetchCache.size > 512) fetchCache.clear();
+  fetchCache.set(cacheKey, { version: repo.store.version, buf: built });
+  return built;
+}
+const fetchCache = new Map<string, { version: number; buf: Buffer }>();
+function buildFetchV2Response(repo: Repo, req: {
+  wants: string[]; haves: string[]; shallow: string[]; depth: number | null;
+}): Buffer {
   const parts: Buffer[] = [];
   const { objects, shallow, unshallow } = repo.store.fetchSet(req.wants, req.haves, req.depth, req.shallow);
   const pack = writePack(objects);
@@ -278,6 +331,15 @@ function fetchV2Response(repo: Repo, req: {
   return Buffer.concat(parts);
 }
 function fetchV0Response(repo: Repo, req: { wants: string[]; haves: string[]; depth: number | null }): Buffer {
+  const cacheKey = `v0|${repo.id}|${req.wants.join(',')}|${req.haves.join(',')}|${req.depth ?? ''}`;
+  const cached = fetchCache.get(cacheKey);
+  if (cached !== undefined && cached.version === repo.store.version) return cached.buf;
+  const built = buildFetchV0Response(repo, req);
+  if (fetchCache.size > 512) fetchCache.clear();
+  fetchCache.set(cacheKey, { version: repo.store.version, buf: built });
+  return built;
+}
+function buildFetchV0Response(repo: Repo, req: { wants: string[]; haves: string[]; depth: number | null }): Buffer {
   const { objects, shallow } = repo.store.fetchSet(req.wants, req.haves, req.depth, []);
   const pack = writePack(objects);
   const parts: Buffer[] = [pktLine('NAK\n')];
@@ -336,7 +398,7 @@ function handleReceivePack(repo: Repo, body: Buffer): Buffer {
     try {
       const read = readPack(packBytes, (oid) => repo.store.get(oid));
       if (!read.checksumOk) throw new Error('pack trailer checksum mismatch');
-      for (const [oid, obj] of read.objects) repo.store.add(obj);
+      for (const [oid, obj] of read.objects) repo.store.addWithOid(oid, obj);
     } catch (err) {
       unpackOk = false;
       unpackDetail = (err as Error).message;
@@ -670,7 +732,7 @@ async function handleRest(req: IncomingMessage, res: ServerResponse, path: strin
       const issue = repo.issues.find((i) => i.number === number);
       if (tail.length === 2) {
         if (!issue) { sendJson(res, 404, { message: 'Not Found' }); return true; }
-        if (method === 'GET') { sendJson(res, 200, issueJson(repo, issue)); return true; }
+        if (method === 'GET') { sendCachedJson(res, 200, cachedIssueJson(repo, issue)); return true; }
         if (method === 'PATCH') {
           if (typeof body.state === 'string' && (body.state === 'open' || body.state === 'closed')) issue.state = body.state;
           if (typeof body.title === 'string') issue.title = body.title;

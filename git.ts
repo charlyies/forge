@@ -331,20 +331,48 @@ export function parseTag(data: Buffer): { object: string; type: ObjType; tag: st
   return { object, type, tag, tagger, message };
 }
 
-/** The object store of one repository (in-memory). */
+/** The object store of one repository (in-memory). Objects are immutable, so parsed
+ *  views are cached forever; `version` bumps only when a genuinely new object lands. */
 export class ObjStore {
   objects = new Map<string, GitObject>();
+  version = 0;
+  private commitCache = new Map<string, CommitView>();
+  private treeCache = new Map<string, TreeEntry[]>();
   get(oid: string): GitObject | undefined { return this.objects.get(oid); }
   has(oid: string): boolean { return this.objects.has(oid); }
   put(type: ObjType, data: Buffer): string {
     const oid = hashObject(type, data);
-    if (!this.objects.has(oid)) this.objects.set(oid, { type, data });
+    if (!this.objects.has(oid)) { this.objects.set(oid, { type, data }); this.version += 1; }
     return oid;
   }
   add(obj: GitObject): string {
     const oid = hashObject(obj.type, obj.data);
-    if (!this.objects.has(oid)) this.objects.set(oid, obj);
+    if (!this.objects.has(oid)) { this.objects.set(oid, obj); this.version += 1; }
     return oid;
+  }
+  /** Store an object whose oid is already known (e.g. from readPack): skips re-hashing. */
+  addWithOid(oid: string, obj: GitObject): void {
+    if (!this.objects.has(oid)) { this.objects.set(oid, obj); this.version += 1; }
+  }
+  /** Parsed commit view, cached: objects never change, so the cache is always sound. */
+  commitView(oid: string): CommitView | null {
+    let view = this.commitCache.get(oid);
+    if (view !== undefined) return view;
+    const obj = this.objects.get(oid);
+    if (obj === undefined || obj.type !== 'commit') return null;
+    view = parseCommit(obj.data);
+    this.commitCache.set(oid, view);
+    return view;
+  }
+  /** Parsed tree entries, cached: objects never change, so the cache is always sound. */
+  treeEntries(oid: string): TreeEntry[] | null {
+    let entries = this.treeCache.get(oid);
+    if (entries !== undefined) return entries;
+    const obj = this.objects.get(oid);
+    if (obj === undefined || obj.type !== 'tree') return null;
+    entries = parseTree(obj.data);
+    this.treeCache.set(oid, entries);
+    return entries;
   }
   /** Peel a tag (possibly nested) to its commit. */
   peel(oid: string): string {
@@ -371,9 +399,9 @@ export class ObjStore {
     while (head < queue.length) {
       const oid = queue[head++]!;
       const d = dist.get(oid)!;
-      const obj = this.objects.get(oid);
-      if (!obj || obj.type !== 'commit') continue;
-      for (const parent of parseCommit(obj.data).parents) {
+      const view = this.commitView(oid);
+      if (view === null) continue;
+      for (const parent of view.parents) {
         if (!dist.has(parent) && this.objects.get(parent)?.type === 'commit') {
           dist.set(parent, d + 1);
           queue.push(parent);
@@ -394,9 +422,9 @@ export class ObjStore {
     let head = 0;
     while (head < queue.length) {
       const oid = queue[head++]!;
-      const obj = this.objects.get(this.peel(oid));
-      if (!obj || obj.type !== 'commit') continue;
-      for (const parent of parseCommit(obj.data).parents) {
+      const view = this.commitView(this.peel(oid));
+      if (view === null) continue;
+      for (const parent of view.parents) {
         if (parent === ancestor) return true;
         if (!seen.has(parent)) { seen.add(parent); queue.push(parent); }
       }
@@ -420,18 +448,18 @@ export class ObjStore {
   /** Full file map (path -> {mode, oid}) of a commit's tree, recursively. */
   fileMap(commitOid: string): Map<string, { mode: string; oid: string }> {
     const out = new Map<string, { mode: string; oid: string }>();
-    const commit = this.objects.get(this.peel(commitOid));
-    if (!commit || commit.type !== 'commit') return out;
+    const view = this.commitView(this.peel(commitOid));
+    if (view === null) return out;
     const walk = (treeOid: string, prefix: string): void => {
-      const tree = this.objects.get(treeOid);
-      if (!tree || tree.type !== 'tree') return;
-      for (const entry of parseTree(tree.data)) {
+      const entries = this.treeEntries(treeOid);
+      if (entries === null) return;
+      for (const entry of entries) {
         const path = prefix ? `${prefix}/${entry.name}` : entry.name;
         if (entry.mode === '40000') walk(entry.oid, path);
         else out.set(path, { mode: entry.mode, oid: entry.oid });
       }
     };
-    walk(parseCommit(commit.data).tree, '');
+    walk(view.tree, '');
     return out;
   }
   /** Commits the client already holds: ancestors of `haves`, not crossing a prior
@@ -452,15 +480,14 @@ export class ObjStore {
     while (head < queue.length) {
       const oid = queue[head++]!;
       objects.add(oid);
-      const obj = this.objects.get(oid);
-      if (!obj || obj.type !== 'commit') continue;
-      const view = parseCommit(obj.data);
+      const view = this.commitView(oid);
+      if (view === null) continue;
       const addTree = (treeOid: string): void => {
         if (objects.has(treeOid)) return;
         objects.add(treeOid);
-        const tree = this.objects.get(treeOid);
-        if (!tree || tree.type !== 'tree') return;
-        for (const entry of parseTree(tree.data)) {
+        const entries = this.treeEntries(treeOid);
+        if (entries === null) return;
+        for (const entry of entries) {
           if (entry.mode === '40000') addTree(entry.oid);
           else objects.add(entry.oid);
         }
@@ -513,10 +540,10 @@ export class ObjStore {
     };
     const addTree = (treeOid: string): void => {
       if (haveObjects.has(treeOid)) return;
-      const tree = this.objects.get(treeOid);
-      if (!tree || tree.type !== 'tree') return;
+      const entries = this.treeEntries(treeOid);
+      if (entries === null) return;
       addObj(treeOid);
-      for (const entry of parseTree(tree.data)) {
+      for (const entry of entries) {
         if (entry.mode === '40000') addTree(entry.oid);
         else addObj(entry.oid);
       }
@@ -524,8 +551,8 @@ export class ObjStore {
     for (const oid of tagObjects) addObj(oid);
     for (const oid of included) {
       addObj(oid);
-      const commit = this.objects.get(oid);
-      if (commit?.type === 'commit') addTree(parseCommit(commit.data).tree);
+      const view = this.commitView(oid);
+      if (view !== null) addTree(view.tree);
     }
     return { objects: [...objects.values()], shallow, unshallow };
   }
