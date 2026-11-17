@@ -15,7 +15,8 @@ export function sha1Hex(data: Buffer): string {
 }
 export function hashObject(type: ObjType, data: Buffer): string {
   const header = Buffer.from(`${type} ${data.length}\0`, 'ascii');
-  return sha1Hex(Buffer.concat([header, data]));
+  // Two updates hash exactly header+data, without copying data into a new buffer.
+  return createHash('sha1').update(header).update(data).digest('hex');
 }
 export function isOid(value: string): boolean {
   return /^[0-9a-f]{40}$/.test(value);
@@ -510,7 +511,13 @@ export class ObjStore {
     const have = this.haveClosure(haves, priorShallow);
     const haveCommits = have.commits;
     const haveObjects = have.objects;
-    const dist = this.commitDistances(wants);
+    // Depth-1 with no haves (the clone workload's shape): only the wants
+    // themselves, at distance 0, can be included — the full commit-distance BFS
+    // over the whole history is pure overhead. Identical result: commitDistances
+    // peels tips and keeps commits only, and with haves empty nothing is excluded.
+    const dist = (depth === 1 && haves.length === 0)
+      ? new Map(wants.map((w) => this.peel(w)).filter((oid) => this.objects.get(oid)?.type === 'commit').map((oid) => [oid, 0] as [string, number]))
+      : this.commitDistances(wants);
     const included = new Set<string>();
     const shallow: string[] = [];
     for (const [oid, d] of dist) {
